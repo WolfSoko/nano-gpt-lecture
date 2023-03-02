@@ -1,13 +1,17 @@
+import os
+from datetime import datetime
+
+import json
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import checkGpu
 
 # hyperparameters
-batch_size = 64  # how many independent sequences will we process in parallel?
-block_size = 512  # what is the maximum context length for predictions?
+batch_size = 32  # how many independent sequences will we process in parallel?
+block_size = 128  # what is the maximum context length for predictions?
 max_iters = 5000
-eval_interval = 500
+eval_interval = 100
 learning_rate = 3e-4
 device = checkGpu.get_device()
 eval_iters = 200
@@ -15,9 +19,19 @@ n_embd = 384  # number of embedded dimensions per char
 n_head = 6  # number of heads in self-attention
 n_layer = 6  # number of self-attention-computation blocks in the model
 dropout = 0.2  # dropout rate
+seed = 1337
 # ------------
 
-torch.manual_seed(1337)
+
+# Erstellen Sie ein Dictionary mit Ihren Modellparametern
+hyper_params = dict(batch_size=batch_size, block_size=block_size, max_iters=max_iters, eval_interval=eval_interval,
+                    learning_rate=learning_rate, device=device, eval_iters=eval_iters, n_embd=n_embd, n_head=n_head,
+                    n_layer=n_layer, dropout=dropout, seed=seed)
+
+print(hyper_params)
+
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
 
 # wget https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
 with open('input.txt', 'r', encoding='utf-8') as f:
@@ -48,21 +62,6 @@ def get_batch(split):
     y = torch.stack([data[i + 1:i + block_size + 1] for i in ix])
     x, y = x.to(device), y.to(device)
     return x, y
-
-
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
 
 
 class Head(nn.Module):
@@ -192,34 +191,76 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
         return idx
 
+@torch.no_grad()
+def estimate_loss(nn):
+    out = {}
+    nn.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = nn(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    nn.train()
+    return out
+
+def train(m, save_model=True, snapshots=True):
+
+    lossis = []
+    learn_date = datetime.utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+    save_folder = f"./trained/{learn_date}/"
+
+    # save hyper_params along with the model
+    if save_model:
+        if not os.path.exists(save_folder):
+            os.makedirs(save_folder)
+
+        with open(f"{save_folder}/hyper_params.json", 'x') as fp:
+            json.dump(hyper_params, fp)
+
+    for i in range(max_iters):
+
+        # every once in a while evaluate the loss on train and val sets
+        if i % eval_interval == 0:
+            losses = estimate_loss(m)
+            print(f"step {i}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+            if save_model & snapshots:
+                torch.save(m, f"{save_folder}/nano_gpt-SNAPSHOT.pth")
+
+        # sample a batch of data
+        xb, yb = get_batch('train')
+
+        # evaluate the loss
+        logits, loss = m(xb, yb)
+        lossis.append(loss.item())
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    if save_model:
+        torch.save(m, f"{save_folder}/nano_gpt-TRAINED.pth")
+
+def generate(nn, max_new_tokens=1000):
+    # generate a new sequence
+    context = torch.zeros((1, 1), dtype=torch.long, device=device)
+    idx = nn.generate(context, max_new_tokens=max_new_tokens)[0].tolist()
+    return decode(idx)
+
+
+## RUN ##
 
 model = BigramLanguageModel()
-print(model.parameters(True))
+
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Total parameter of model: {total_params:,.0f}")
+
 m = model.to(device)
 
 # create a PyTorch optimizer
 optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
+train(m, True, True)  # generate from the model
 
-for iter in range(max_iters):
 
-    # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0:
-        ma = torch.cuda.memory_allocated()
-        print("cuda memory allocated:", ma / 1024 ** 3, "GB")
-        mr = torch.cuda.memory_reserved()
-        print("cuda memory reserved:", mr / 1024 ** 3, "GB")
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-
-    # sample a batch of data
-    xb, yb = get_batch('train')
-
-    # evaluate the loss
-    logits, loss = m(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-
-# generate from the model
-context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+print(generate(m, 1000))

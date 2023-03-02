@@ -3,9 +3,9 @@ import torch
 
 def get_device():
     if torch.cuda.is_available():
-        return torch.device('cuda')
+        return 'cuda'
     else:
-        return torch.device('cpu')
+        return 'cpu'
 
 def gpu_info():
     if torch.cuda.is_available():
